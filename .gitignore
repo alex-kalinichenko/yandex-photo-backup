@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Secrets and session data — never commit
+cookies.json
+*.cookies.json
+.auth_cache/
+
+# Local API dumps may contain uid and signed URLs
+_sample_api_response.json
+*_sample*.json
+*_api_response*.json
+
+# Backup state and partial downloads
+*.sqlite
+*.sqlite-*
+.part
+*.part
+logs/
+
+# Private research / nested clones
+_research_yadisk_backup/
+agent-tools/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

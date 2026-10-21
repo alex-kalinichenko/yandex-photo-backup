@@ -1,0 +1,18 @@
+[
+  {
+    "name": "Session_id",
+    "value": "PASTE_YOUR_SESSION_ID_HERE",
+    "domain": ".yandex.ru",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true
+  },
+  {
+    "name": "sessionid2",
+    "value": "PASTE_YOUR_SESSIONID2_HERE",
+    "domain": ".yandex.ru",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true
+  }
+]
