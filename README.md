@@ -1,5 +1,11 @@
 # Yandex Unlimited Photos Backup
 
+**This tool exists to download all photos and videos from Yandex Disk Unlimited
+storage** — the media that sits in the «Фото» / Photoslice timeline and **cannot
+be bulk-exported by ordinary means** (Disk desktop app, web UI “download folder”,
+or the public Disk API). Official clients either skip Unlimited originals, offer
+only previews, or make a full local copy impractical for large libraries.
+
 Local, resumable backup of **Yandex Disk Unlimited Photos** (Photoslice / «Фото»).
 Downloads originals to your disk with SQLite state, size verification, and adaptive
 parallelism when Yandex CDN clusters are slow or flaky.
