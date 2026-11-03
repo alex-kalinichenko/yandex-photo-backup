@@ -209,7 +209,9 @@ class YandexPhotoClient:
 
     def prepare_download_url(self, paths: list[str]) -> str:
         """Ask MPFS for a temporary download URL (ZIP for one or more paths)."""
-        data = self.api('mpfs/bulk-download-prepare', {'items': paths}, retries=2)
+        # Videos rely on this path. Keep retries modest so a 429 does not park a
+        # worker for minutes; the downloader circuit-breaker will back off.
+        data = self.api('mpfs/bulk-download-prepare', {'items': paths}, retries=3)
         url = None
         if isinstance(data, dict):
             url = data.get('download_url') or data.get('url')
@@ -227,7 +229,7 @@ class YandexPhotoClient:
     def get_file_url(self, path: str) -> str | None:
         """Try mpfs/url for a direct single-file URL. Returns None if unsupported."""
         try:
-            data = self.api('mpfs/url', {'path': path})
+            data = self.api('mpfs/url', {'path': path}, retries=2)
         except Exception as exc:
             logger.debug('mpfs/url failed for %s: %s', path, exc)
             return None
@@ -251,11 +253,15 @@ class YandexPhotoClient:
         timeout: tuple[int, int] = (20, 300),
         speed_limit_bps: int = 256,
         speed_time_s: int = 60,
+        resume: bool = True,
     ):
         """Download URL to dest_path; return (bytes_written, content_type).
 
         Prefer Windows curl.exe for CDN downloads: curl_cffi often stalls on
         downloader.disk.yandex.ru even when signed URLs are valid.
+
+        When resume=True and dest_path already has bytes, continue with HTTP Range
+        (curl -C -) so large videos can survive stalls / restarts.
         """
         import shutil
         import subprocess
@@ -263,53 +269,58 @@ class YandexPhotoClient:
 
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        existing = dest.stat().st_size if dest.exists() else 0
+        use_resume = bool(resume and existing > 0)
+
         curl = shutil.which('curl.exe') or shutil.which('curl')
         if curl:
             max_time = int(timeout[0] + timeout[1])
             connect_timeout = max(3, int(timeout[0]))
-            # Adaptive stall: short when CDN is bad, more patient when healthy.
-            cmd = [
+            cmd = build_curl_download_cmd(
                 curl,
-                '-fsSL',
-                '--http1.1',
-                '--connect-timeout',
-                str(connect_timeout),
-                '--max-time',
-                str(max_time),
-                '--speed-limit',
-                str(max(1, int(speed_limit_bps))),
-                '--speed-time',
-                str(max(1, int(speed_time_s))),
-                '-A',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                '-e',
-                f'{BASE}/client/photo',
-                '-o',
-                str(dest),
                 url,
-            ]
+                dest,
+                connect_timeout=connect_timeout,
+                max_time=max_time,
+                speed_limit_bps=speed_limit_bps,
+                speed_time_s=speed_time_s,
+                resume=use_resume,
+            )
             result = subprocess.run(cmd, capture_output=True, text=True)
+            written = dest.stat().st_size if dest.exists() else 0
             if result.returncode != 0:
                 err = (result.stderr or result.stdout or '').strip()
                 if '429' in err:
                     raise RateLimitError('download HTTP 429')
+                # curl 33 = HTTP range not satisfiable — file may already be complete
+                if use_resume and written > 0 and result.returncode in {33}:
+                    return written, ''
                 raise RuntimeError(f'curl failed ({result.returncode}): {err[:300]}')
-            written = dest.stat().st_size if dest.exists() else 0
             if written <= 0:
                 raise RuntimeError('curl wrote 0 bytes')
             return written, ''
 
         # Fallback: curl_cffi (may stall on some CDN hosts).
-        written = 0
+        headers = {}
+        if use_resume:
+            headers['Range'] = f'bytes={existing}-'
+        written = existing if use_resume else 0
         content_type = ''
-        resp = self.session.get(url, stream=True, timeout=timeout, allow_redirects=True)
+        resp = self.session.get(
+            url,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=True,
+            headers=headers or None,
+        )
         try:
             if resp.status_code == 429:
                 raise RateLimitError('download HTTP 429')
             if resp.status_code >= 500:
                 raise RuntimeError(f'download HTTP {resp.status_code}')
-            if resp.status_code != 200:
+            if use_resume and resp.status_code == 416:
+                return written, ''
+            if resp.status_code not in {200, 206}:
                 body = ''
                 try:
                     body = resp.text[:200]
@@ -317,7 +328,10 @@ class YandexPhotoClient:
                     body = ''
                 raise RuntimeError(f'download HTTP {resp.status_code}: {body}')
             content_type = (resp.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-            with open(dest, 'wb') as out:
+            mode = 'ab' if (use_resume and resp.status_code == 206) else 'wb'
+            if mode == 'wb':
+                written = 0
+            with open(dest, mode) as out:
                 for chunk in resp.iter_content(1024 * 1024):
                     if chunk:
                         out.write(chunk)
@@ -328,3 +342,42 @@ class YandexPhotoClient:
             except Exception:
                 pass
         return written, content_type
+
+
+def build_curl_download_cmd(
+    curl: str,
+    url: str,
+    dest,
+    *,
+    connect_timeout: int,
+    max_time: int,
+    speed_limit_bps: int,
+    speed_time_s: int,
+    resume: bool,
+) -> list[str]:
+    """Build curl argv for a CDN download (testable helper)."""
+    from pathlib import Path
+
+    dest_s = str(Path(dest))
+    cmd = [
+        curl,
+        '-fsSL',
+        '--http1.1',
+        '--connect-timeout',
+        str(connect_timeout),
+        '--max-time',
+        str(max_time),
+        '--speed-limit',
+        str(max(1, int(speed_limit_bps))),
+        '--speed-time',
+        str(max(1, int(speed_time_s))),
+        '-A',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        '-e',
+        f'{BASE}/client/photo',
+    ]
+    if resume:
+        cmd.extend(['-C', '-'])
+    cmd.extend(['-o', dest_s, url])
+    return cmd

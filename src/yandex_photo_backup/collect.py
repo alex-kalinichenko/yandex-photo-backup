@@ -50,7 +50,8 @@ def _original_from_meta(meta: dict[str, Any]) -> tuple[str | None, str | None, i
     for entry in sizes:
         if not isinstance(entry, dict):
             continue
-        if str(entry.get('name', '')).upper() != 'ORIGINAL':
+        # Photos use ORIGINAL; some Disk video/file entries expose FILE.
+        if str(entry.get('name', '')).upper() not in {'ORIGINAL', 'FILE'}:
             continue
         url = _abs_url(entry.get('url'))
         md5 = None

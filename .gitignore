@@ -23,6 +23,9 @@ _sample_api_response.json
 *.part
 logs/
 
+# Local machine backup root override (may point at a drive letter)
+.backup_root
+
 # Private research / nested clones
 _research_yadisk_backup/
 agent-tools/

@@ -23,9 +23,20 @@ class Config:
 
     @classmethod
     def from_env(cls, root: Path | None = None) -> Config:
-        default_root = Path.home() / 'YandexPhoto'
-        base = Path(root or os.environ.get('YANDEX_PHOTO_ROOT', str(default_root)))
         project = Path(__file__).resolve().parents[2]
+        env_root = os.environ.get('YANDEX_PHOTO_ROOT')
+        marker = project / '.backup_root'
+        if root is not None:
+            base = Path(root)
+        elif env_root:
+            base = Path(env_root)
+        elif marker.is_file():
+            line = marker.read_text(encoding='utf-8').strip().splitlines()[0].strip()
+            base = Path(line) if line else Path.home() / 'YandexPhoto'
+        elif Path(r'D:\YandexPhoto').is_dir():
+            base = Path(r'D:\YandexPhoto')
+        else:
+            base = Path.home() / 'YandexPhoto'
         cookies = Path(os.environ.get('YANDEX_PHOTO_COOKIES', project / 'cookies.json'))
         return cls(
             root=base,

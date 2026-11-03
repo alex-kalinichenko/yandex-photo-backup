@@ -12,14 +12,33 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP = ROOT / 'backup.py'
-DATA_ROOT = Path(os.environ.get('YANDEX_PHOTO_ROOT', Path.home() / 'YandexPhoto'))
+
+
+def _resolve_data_root() -> Path:
+    """Prefer YANDEX_PHOTO_ROOT; never silently fall back to the system drive home."""
+    env = os.environ.get('YANDEX_PHOTO_ROOT')
+    if env:
+        return Path(env)
+    marker = ROOT / '.backup_root'
+    if marker.is_file():
+        line = marker.read_text(encoding='utf-8').strip().splitlines()[0].strip()
+        if line:
+            return Path(line)
+    # Legacy Windows external disk used by this project
+    legacy = Path(r'D:\YandexPhoto')
+    if legacy.is_dir():
+        return legacy
+    return Path.home() / 'YandexPhoto'
+
+
+DATA_ROOT = _resolve_data_root()
 LOG = DATA_ROOT / 'logs' / 'download-adaptive.log'
+# Photos first (DB order), then videos. No --with-md5-only: download everything.
 DEFAULT_ARGS = [
     str(BACKUP),
     'download',
     '--media',
-    'photos',
-    '--with-md5-only',
+    'all',
     '--workers',
     '6',
 ]
