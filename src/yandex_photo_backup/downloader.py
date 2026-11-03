@@ -20,6 +20,9 @@ from .verify import md5_file, verify_local_file
 logger = logging.getLogger(__name__)
 
 _PREPARE_BLOCKED_UNTIL = 0.0
+_PREPARE_LOCK = threading.Lock()
+_PREPARE_LAST_CALL = 0.0
+_PREPARE_MIN_INTERVAL_S = 8.0
 DEFAULT_WORKERS = 4
 
 
@@ -134,21 +137,56 @@ def _download_via_prepare(
     part_path: Path,
     zip_part: Path,
     zip_path: Path,
+    *,
+    expected_size: int = 0,
+    controller: AdaptiveController | None = None,
 ) -> None:
-    global _PREPARE_BLOCKED_UNTIL
+    """Download one Disk path via bulk-download-prepare (used for videos).
+
+    Serializes prepare calls and keeps zip .part for resume across stalls.
+    """
+    global _PREPARE_BLOCKED_UNTIL, _PREPARE_LAST_CALL
     if time.time() < _PREPARE_BLOCKED_UNTIL:
         raise RateLimitError('prepare circuit open')
     try:
-        zip_url = client.prepare_download_url([remote_path])
-        written, _content_type = client.download_bytes_stream(
-            zip_url, zip_part, timeout=(20, 600)
+        with _PREPARE_LOCK:
+            gap = _PREPARE_MIN_INTERVAL_S - (time.time() - _PREPARE_LAST_CALL)
+            if gap > 0:
+                time.sleep(gap)
+            zip_url = client.prepare_download_url([remote_path])
+            _PREPARE_LAST_CALL = time.time()
+
+        if controller is not None:
+            stall = controller.curl_stall()
+            read_timeout = controller.cdn_read_timeout_s(max(expected_size, 50_000_000))
+            speed_limit = stall.speed_limit_bps
+            speed_time = stall.speed_time_s
+        else:
+            # Large videos: allow multi-hour transfers with resume.
+            read_timeout = min(6 * 3600, max(300, expected_size // 50_000 + 300))
+            speed_limit = 256
+            speed_time = 90
+
+        written, content_type = client.download_bytes_stream(
+            zip_url,
+            zip_part,
+            timeout=(20, read_timeout),
+            speed_limit_bps=speed_limit,
+            speed_time_s=speed_time,
+            resume=True,
         )
         if written <= 0:
             raise RuntimeError('ZIP download wrote 0 bytes')
+        # Promote .zip.part -> .zip only when complete enough to extract / use.
         zip_part.replace(zip_path)
         if zipfile.is_zipfile(zip_path):
             _extract_single_from_zip(zip_path, part_path)
+            try:
+                zip_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         else:
+            # Some prepare responses are a raw single file, not a ZIP.
             zip_path.replace(part_path)
     except Exception as exc:
         if isinstance(exc, RateLimitError) or '429' in str(exc):
@@ -179,9 +217,15 @@ def download_one(
     url: str | None = None,
     controller: AdaptiveController | None = None,
 ) -> tuple[bool, str, Path | None]:
-    """Download and verify one object. Returns (ok, message, final_path)."""
+    """Download and verify one object. Returns (ok, message, final_path).
+
+    Supports resume: partial ``*.part`` / ``*.zip.part`` files are kept and
+    continued with HTTP Range (curl -C -). Videos without Photoslice ORIGINAL
+    URLs are fetched via ``mpfs/bulk-download-prepare``.
+    """
     remote_id = row['remote_id']
     remote_path = _normalize_remote_path(row)
+    expected_size = int(row['size'] or 0)
 
     desired = local_path_for(row, files_root)
     if desired.exists():
@@ -202,25 +246,38 @@ def download_one(
     tmp_root.mkdir(parents=True, exist_ok=True)
     final_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for p in (part_path, zip_part, zip_path):
+    # Resume: keep existing .part / .zip.part. Only drop a completed leftover .zip.
+    if zip_path.exists() and not zip_part.exists():
         try:
-            p.unlink(missing_ok=True)
+            zip_path.unlink(missing_ok=True)
         except OSError:
             pass
 
+    # If a previous run left a complete .part, finalize without re-download.
+    if part_path.exists() and expected_size > 0 and part_path.stat().st_size == expected_size:
+        ok, reason, actual_md5 = verify_local_file(
+            part_path,
+            expected_size=row['size'],
+            expected_md5=row['md5'],
+        )
+        if ok:
+            _safe_replace(part_path, final_path)
+            return True, f'resumed complete part md5={actual_md5}', final_path
+
+    success = False
     try:
         errors: list[str] = []
         downloaded = False
 
         def _try_cdn(cdn_url: str) -> bool:
-            size = int(row['size'] or 0)
+            size = expected_size
             if controller is not None:
                 stall = controller.curl_stall()
                 read_timeout = controller.cdn_read_timeout_s(size)
                 speed_limit = stall.speed_limit_bps
                 speed_time = stall.speed_time_s
             else:
-                read_timeout = min(3600, max(120, size // 512 + 90))
+                read_timeout = min(6 * 3600, max(120, (size // 50_000) + 120 if size else 300))
                 speed_limit = 256
                 speed_time = 60
             written, content_type = client.download_bytes_stream(
@@ -229,6 +286,7 @@ def download_one(
                 timeout=(15, read_timeout),
                 speed_limit_bps=speed_limit,
                 speed_time_s=speed_time,
+                resume=True,
             )
             if content_type in {'application/zip', 'application/x-zip-compressed'}:
                 part_path.replace(zip_path)
@@ -243,44 +301,84 @@ def download_one(
                     errors.append('ORIGINAL wrote 0 bytes')
             except Exception as exc:
                 errors.append(f'ORIGINAL CDN: {exc}')
+            # Do not fall through to prepare after a failed ORIGINAL attempt:
+            # prepare is heavily rate-limited and would block photo workers.
 
-        if not downloaded and bool(getattr(client, 'allow_prepare', False)):
+        # Videos / Disk paths usually have no Photoslice ORIGINAL — use prepare.
+        if not downloaded and not url:
+            direct = None
             try:
-                _download_via_prepare(client, remote_path, part_path, zip_part, zip_path)
-                downloaded = True
-            except RateLimitError as exc:
-                errors.append(str(exc))
+                direct = client.get_file_url(remote_path)
             except Exception as exc:
-                errors.append(f'prepare: {exc}')
+                errors.append(f'mpfs/url: {exc}')
+            if direct:
+                try:
+                    downloaded = _try_cdn(direct)
+                    if not downloaded:
+                        errors.append('mpfs/url wrote 0 bytes')
+                except Exception as exc:
+                    errors.append(f'mpfs/url CDN: {exc}')
+
+            if not downloaded:
+                try:
+                    _download_via_prepare(
+                        client,
+                        remote_path,
+                        part_path,
+                        zip_part,
+                        zip_path,
+                        expected_size=expected_size,
+                        controller=controller,
+                    )
+                    downloaded = True
+                except RateLimitError as exc:
+                    errors.append(str(exc))
+                except Exception as exc:
+                    errors.append(f'prepare: {exc}')
 
         if not downloaded:
             raise RuntimeError('; '.join(errors) or 'no download method succeeded')
-
         ok, reason, actual_md5 = verify_local_file(
             part_path,
             expected_size=row['size'],
             expected_md5=row['md5'],
         )
         if not ok:
-            try:
-                part_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Corrupt / HTML error page: drop part so the next attempt starts clean.
+            # Size mismatch on a still-growing resume is kept only if below expected.
+            keep_partial = (
+                expected_size > 0
+                and part_path.exists()
+                and 0 < part_path.stat().st_size < expected_size
+                and 'mismatch' in reason
+            )
+            if not keep_partial:
+                try:
+                    part_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return False, reason, None
 
         _safe_replace(part_path, final_path)
-        return True, f'verified md5={actual_md5}', final_path
+        success = True
+        label = f'verified md5={actual_md5}' if row['md5'] else f'verified size={expected_size}'
+        return True, label, final_path
     except (AuthExpiredError, CaptchaRequiredError):
         raise
     except Exception as exc:
         return False, f'{type(exc).__name__}: {exc}', None
     finally:
-        for p in (zip_part, zip_path, part_path):
+        # On success: remove leftover temps. On failure: keep .part / .zip.part for resume.
+        if success:
+            for p in (zip_part, zip_path, part_path):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
             try:
-                if p.exists() and p.suffix.endswith('part'):
-                    # Keep verified final; only clean leftovers.
-                    if p != final_path:
-                        p.unlink(missing_ok=True)
+                if zip_path.exists():
+                    zip_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -433,8 +531,16 @@ def download_pending(
                 controller.record(False, rate_limited='429' in str(exc))
 
         work_rows = list(cluster_rows)
-        if adaptive and controller.prefer_small_first():
-            work_rows.sort(key=lambda r: int(r['size'] or 0))
+        # ORIGINAL CDN first (photos), then prepare-only items (videos). Avoids
+        # blocking photo workers behind rate-limited bulk-download-prepare.
+        small_first = adaptive and controller.prefer_small_first()
+        work_rows.sort(
+            key=lambda r: (
+                0 if _lookup_url(urls, r) else 1,
+                0 if not str(r['media_type'] or '').lower().startswith('video/') else 1,
+                int(r['size'] or 0) if small_first else 0,
+            )
+        )
 
         ok_before = counters['ok']
         cluster_ok = 0
