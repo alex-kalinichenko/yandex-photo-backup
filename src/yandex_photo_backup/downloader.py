@@ -146,10 +146,21 @@ def _download_via_prepare(
     Serializes prepare calls and keeps zip .part for resume across stalls.
     """
     global _PREPARE_BLOCKED_UNTIL, _PREPARE_LAST_CALL
-    if time.time() < _PREPARE_BLOCKED_UNTIL:
-        raise RateLimitError('prepare circuit open')
+    # Wait out the circuit instead of failing the whole video queue in seconds
+    # (instant "circuit open" failures were burning attempts → failed_permanent).
+    while time.time() < _PREPARE_BLOCKED_UNTIL:
+        wait = _PREPARE_BLOCKED_UNTIL - time.time()
+        logger.warning(
+            'prepare circuit open — waiting %.0fs before next video prepare',
+            max(1.0, wait),
+        )
+        time.sleep(min(60.0, max(1.0, wait)))
     try:
         with _PREPARE_LOCK:
+            # Re-check under lock: another worker may have tripped the circuit.
+            while time.time() < _PREPARE_BLOCKED_UNTIL:
+                wait = _PREPARE_BLOCKED_UNTIL - time.time()
+                time.sleep(min(60.0, max(1.0, wait)))
             gap = _PREPARE_MIN_INTERVAL_S - (time.time() - _PREPARE_LAST_CALL)
             if gap > 0:
                 time.sleep(gap)
@@ -458,7 +469,11 @@ def download_pending(
             controller=controller if adaptive else None,
         )
         duration = time.time() - t0
-        rate_limited = (not ok) and ('429' in message or 'rate limit' in message.lower())
+        rate_limited = (not ok) and (
+            '429' in message
+            or 'rate limit' in message.lower()
+            or 'circuit open' in message.lower()
+        )
         bytes_written = int(row['size'] or 0) if ok else 0
         if adaptive:
             controller.record(
@@ -475,8 +490,20 @@ def download_pending(
                 counters['ok'] += 1
             logger.info('OK %s — %s (%.1fs)', row['name'], message, duration)
             return True
+        # Circuit / 429: keep as pending without permanent pressure from spam fails.
+        soft = 'circuit open' in message.lower() or 'prepare http 429' in message.lower()
         with db_lock:
-            db.mark_failed(row['remote_id'], message, permanent=False)
+            if soft:
+                # Do not consume attempt budget on API rate limits.
+                db.conn.execute(
+                    "UPDATE objects SET download_status='pending', "
+                    'attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END, '
+                    'error=?, updated_at=? WHERE remote_id=?',
+                    (message, time.time(), row['remote_id']),
+                )
+                db.conn.commit()
+            else:
+                db.mark_failed(row['remote_id'], message, permanent=False)
         with counter_lock:
             counters['failed'] += 1
         logger.warning('FAIL %s — %s (%.1fs)', row['name'], message, duration)
