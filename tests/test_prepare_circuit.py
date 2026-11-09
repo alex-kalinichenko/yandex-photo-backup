@@ -1,24 +1,24 @@
-"""Prepare circuit must wait instead of instantly failing videos."""
+"""Prepare circuit must fail fast (not sleep) so CDN workers stay free."""
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
 
+import pytest
+
 import yandex_photo_backup.downloader as dl
+from yandex_photo_backup.client import RateLimitError
 
 
-def test_prepare_waits_for_circuit() -> None:
-    dl._PREPARE_BLOCKED_UNTIL = time.time() + 0.35
-    calls: list[float] = []
+def test_prepare_fails_fast_when_circuit_open() -> None:
+    dl._PREPARE_BLOCKED_UNTIL = time.time() + 30
 
     class _Client:
         def prepare_download_url(self, _paths: list[str]) -> str:
-            calls.append(time.time())
-            assert time.time() >= dl._PREPARE_BLOCKED_UNTIL - 0.05
-            raise RuntimeError('stop-after-wait')
+            raise AssertionError('prepare must not be called while circuit is open')
 
-    try:
+    with pytest.raises(RateLimitError, match='circuit open'):
         dl._download_via_prepare(
             _Client(),  # type: ignore[arg-type]
             '/disk/Photo/a.mp4',
@@ -27,8 +27,3 @@ def test_prepare_waits_for_circuit() -> None:
             Path('x.zip'),
             expected_size=1000,
         )
-    except RuntimeError as exc:
-        assert 'stop-after-wait' in str(exc)
-    else:
-        raise AssertionError('expected RuntimeError from stub client')
-    assert calls, 'prepare should run after waiting out the circuit'
