@@ -146,21 +146,14 @@ def _download_via_prepare(
     Serializes prepare calls and keeps zip .part for resume across stalls.
     """
     global _PREPARE_BLOCKED_UNTIL, _PREPARE_LAST_CALL
-    # Wait out the circuit instead of failing the whole video queue in seconds
-    # (instant "circuit open" failures were burning attempts → failed_permanent).
-    while time.time() < _PREPARE_BLOCKED_UNTIL:
-        wait = _PREPARE_BLOCKED_UNTIL - time.time()
-        logger.warning(
-            'prepare circuit open — waiting %.0fs before next video prepare',
-            max(1.0, wait),
-        )
-        time.sleep(min(60.0, max(1.0, wait)))
+    # Do not sleep here: sleeping parks the only adaptive worker and freezes
+    # CDN photo progress. Caller soft-fails and retries after the circuit cools.
+    if time.time() < _PREPARE_BLOCKED_UNTIL:
+        raise RateLimitError('prepare circuit open')
     try:
         with _PREPARE_LOCK:
-            # Re-check under lock: another worker may have tripped the circuit.
-            while time.time() < _PREPARE_BLOCKED_UNTIL:
-                wait = _PREPARE_BLOCKED_UNTIL - time.time()
-                time.sleep(min(60.0, max(1.0, wait)))
+            if time.time() < _PREPARE_BLOCKED_UNTIL:
+                raise RateLimitError('prepare circuit open')
             gap = _PREPARE_MIN_INTERVAL_S - (time.time() - _PREPARE_LAST_CALL)
             if gap > 0:
                 time.sleep(gap)
@@ -441,9 +434,20 @@ def download_pending(
 
     clusters = list(by_cluster.items())
     total_files = sum(len(v) for v in by_cluster.values()) + len(no_cluster)
+    deferred_prepare: list[tuple] = []  # (row, url_or_none)
 
     def _process(row, url: str | None) -> bool:
         nonlocal done_files
+        # Never park CDN workers on prepare rate-limit waits.
+        if not url and time.time() < _PREPARE_BLOCKED_UNTIL:
+            with counter_lock:
+                counters['skipped'] += 1
+            logger.info(
+                'DEFER %s — prepare circuit open (%.0fs left)',
+                row['name'],
+                max(0.0, _PREPARE_BLOCKED_UNTIL - time.time()),
+            )
+            return False
         with counter_lock:
             done_files += 1
             idx = done_files
@@ -557,26 +561,23 @@ def download_pending(
             if adaptive:
                 controller.record(False, rate_limited='429' in str(exc))
 
-        work_rows = list(cluster_rows)
-        # ORIGINAL CDN first (photos), then prepare-only items (videos). Avoids
-        # blocking photo workers behind rate-limited bulk-download-prepare.
+        # Phase A: ORIGINAL CDN only. Prepare-only (typical videos) deferred so a
+        # 429 circuit cannot freeze photo progress when workers=1.
         small_first = adaptive and controller.prefer_small_first()
-        work_rows.sort(
-            key=lambda r: (
-                0 if _lookup_url(urls, r) else 1,
-                0 if not str(r['media_type'] or '').lower().startswith('video/') else 1,
-                int(r['size'] or 0) if small_first else 0,
-            )
-        )
+        cdn_rows = [r for r in cluster_rows if _lookup_url(urls, r)]
+        prep_rows = [r for r in cluster_rows if not _lookup_url(urls, r)]
+        deferred_prepare.extend((r, None) for r in prep_rows)
+        if small_first:
+            cdn_rows.sort(key=lambda r: int(r['size'] or 0))
 
         ok_before = counters['ok']
         cluster_ok = 0
         cluster_fail = 0
         abandoned = False
         cursor = 0
-        while cursor < len(work_rows):
-            worker_n = max(1, min(controller.workers, len(work_rows) - cursor))
-            batch = work_rows[cursor : cursor + worker_n]
+        while cursor < len(cdn_rows):
+            worker_n = max(1, min(controller.workers, len(cdn_rows) - cursor))
+            batch = cdn_rows[cursor : cursor + worker_n]
             cursor += len(batch)
             batch_ok, batch_fail = _run_batch(batch, urls)
             cluster_ok += batch_ok
@@ -585,9 +586,9 @@ def download_pending(
                 cluster_ok=cluster_ok,
                 cluster_fail=cluster_fail,
             ):
-                left = len(work_rows) - cursor
+                left = len(cdn_rows) - cursor
                 logger.warning(
-                    'Abandoning cluster %s after %s fails / %s ok (%s files deferred)',
+                    'Abandoning cluster %s after %s fails / %s ok (%s CDN files deferred)',
                     cluster_id,
                     cluster_fail,
                     cluster_ok,
@@ -596,9 +597,8 @@ def download_pending(
                 abandoned = True
                 break
 
-        # Retry pass only if the cluster had some CDN success (URLs not globally dead).
         cluster_ok_total = counters['ok'] - ok_before
-        if not abandoned and cluster_ok_total > 0:
+        if not abandoned and cluster_ok_total > 0 and cdn_rows:
             with db_lock:
                 verified_ids = {
                     r['remote_id']
@@ -608,7 +608,7 @@ def download_pending(
                         (cluster_id,),
                     )
                 }
-            failed_ids = [row for row in work_rows if row['remote_id'] not in verified_ids]
+            failed_ids = [row for row in cdn_rows if row['remote_id'] not in verified_ids]
             if failed_ids:
                 time.sleep(0.3)
                 try:
@@ -622,11 +622,40 @@ def download_pending(
         time.sleep(delay)
 
     for row in no_cluster:
-        try:
-            _process(row, None)
-        except (AuthExpiredError, CaptchaRequiredError):
-            if stop_on_auth_error:
-                raise
+        # Unknown cluster: try CDN path only if we somehow get a URL later via prepare.
+        deferred_prepare.append((row, None))
+
+    # Phase B: prepare-only items (Disk videos / files without ORIGINAL).
+    if deferred_prepare:
+        logger.info(
+            'CDN pass done; starting prepare pass for %s items (workers=1)',
+            len(deferred_prepare),
+        )
+        if adaptive:
+            controller.workers = 1
+            controller.max_workers = 1
+        for row, _url in deferred_prepare:
+            # Skip if already verified during CDN pass.
+            with db_lock:
+                st = db.conn.execute(
+                    'SELECT verify_status FROM objects WHERE remote_id=?',
+                    (row['remote_id'],),
+                ).fetchone()
+            if st and st['verify_status'] == 'verified':
+                continue
+            # If circuit is open, wait once (outside CDN phase) then continue.
+            if time.time() < _PREPARE_BLOCKED_UNTIL:
+                wait = _PREPARE_BLOCKED_UNTIL - time.time()
+                logger.warning(
+                    'prepare circuit open before prepare pass — sleeping %.0fs',
+                    wait,
+                )
+                time.sleep(min(wait + 1.0, 960.0))
+            try:
+                _process(row, None)
+            except (AuthExpiredError, CaptchaRequiredError):
+                if stop_on_auth_error:
+                    raise
 
     final = controller.state()
     logger.info(
