@@ -61,6 +61,84 @@ def _maybe_dehydrate(src: Path, dest: Path, *, enabled: bool) -> bool:
     return ok
 
 
+def _reclaim_verified(
+    db: ManifestDB,
+    yd: Path,
+    files_dir: Path,
+    *,
+    media_filter: str,
+    dry_run: bool,
+    limit: int | None,
+) -> int:
+    """Dehydrate Yandex.Disk sources that already have a verified backup elsewhere."""
+    rows = list(
+        db.conn.execute(
+            f"""
+            SELECT remote_id, name, remote_path, size, md5, media_type, year, month,
+                   local_path
+            FROM objects
+            WHERE verify_status = 'verified'
+              AND remote_path LIKE '/disk/%'
+              {media_filter}
+            ORDER BY size DESC
+            """
+        )
+    )
+    if limit is not None:
+        rows = rows[:limit]
+
+    freed = 0
+    freed_bytes = 0
+    logger.info(
+        "Reclaim pass: scanning %s verified /disk/ objects (free=%.1fGB)",
+        len(rows),
+        free_bytes(yd) / (1024**3),
+    )
+    for row in rows:
+        src = _disk_local_path(yd, row["remote_path"])
+        if src is None or not src.is_file():
+            continue
+        if is_cloud_placeholder(src):
+            continue
+        dest = (
+            Path(row["local_path"])
+            if row["local_path"]
+            else local_path_for(row, files_dir)
+        )
+        if not dest.is_file():
+            continue
+        if same_volume(src, dest):
+            continue
+        ok, _reason, _ = verify_local_file(
+            dest, expected_size=row["size"], expected_md5=row["md5"]
+        )
+        if not ok:
+            continue
+        size = int(row["size"] or 0)
+        if dry_run:
+            logger.info("DRY-RUN dehydrate %s (%s bytes)", src, size)
+            freed += 1
+            freed_bytes += size
+            continue
+        if _maybe_dehydrate(src, dest, enabled=True):
+            freed += 1
+            freed_bytes += size
+            if freed % 50 == 0:
+                logger.info(
+                    "reclaim dehydrated=%s (%.1f GB) free=%.1fGB",
+                    freed,
+                    freed_bytes / 1e9,
+                    free_bytes(yd) / (1024**3),
+                )
+    logger.info(
+        "Reclaim done dehydrated=%s (%.2f GB) free=%.1fGB",
+        freed,
+        freed_bytes / 1e9,
+        free_bytes(yd) / (1024**3),
+    )
+    return freed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -82,6 +160,16 @@ def main() -> int:
         "--keep-local",
         action="store_true",
         help="Do not dehydrate Yandex.Disk sources after a verified copy",
+    )
+    ap.add_argument(
+        "--reclaim-verified",
+        action="store_true",
+        help="Also dehydrate sources for objects already verified on the backup volume",
+    )
+    ap.add_argument(
+        "--reclaim-only",
+        action="store_true",
+        help="Skip import; only dehydrate sources of already-verified /disk/ objects",
     )
     ap.add_argument(
         "--min-free-gb",
@@ -111,41 +199,53 @@ def main() -> int:
     elif args.media in {"video", "videos"}:
         media_filter = " AND COALESCE(media_type, '') LIKE 'video/%'"
 
-    rows = list(
-        db.conn.execute(
-            f"""
-            SELECT remote_id, name, remote_path, size, md5, media_type, year, month,
-                   download_status
-            FROM objects
-            WHERE download_status IN ('pending', 'failed', 'failed_permanent')
-            {media_filter}
-            ORDER BY size ASC
-            """
-        )
-    )
-    if args.limit:
-        rows = rows[: args.limit]
-
-    imported = 0
-    imported_bytes = 0
-    missing = 0
-    size_mismatch = 0
-    errors = 0
-    dehydrated = 0
-    skipped_low_space = 0
     dehydrate_after = not args.keep_local and not args.dry_run
-    reserve_bytes = int(max(0.0, args.min_free_gb) * (1024**3))
-
-    logger.info(
-        "Scanning %s pending/failed objects against %s (dehydrate=%s min_free=%.1fGB)",
-        len(rows),
-        yd,
-        dehydrate_after,
-        reserve_bytes / (1024**3),
-    )
-    logger.info("sync volume free=%.1f GB", free_bytes(yd) / (1024**3))
-
     try:
+        if args.reclaim_only or args.reclaim_verified:
+            _reclaim_verified(
+                db,
+                yd,
+                cfg.files_dir,
+                media_filter=media_filter,
+                dry_run=args.dry_run,
+                limit=args.limit if args.reclaim_only else None,
+            )
+            if args.reclaim_only:
+                return 0
+
+        rows = list(
+            db.conn.execute(
+                f"""
+                SELECT remote_id, name, remote_path, size, md5, media_type, year, month,
+                       download_status
+                FROM objects
+                WHERE download_status IN ('pending', 'failed', 'failed_permanent')
+                {media_filter}
+                ORDER BY size ASC
+                """
+            )
+        )
+        if args.limit:
+            rows = rows[: args.limit]
+
+        imported = 0
+        imported_bytes = 0
+        missing = 0
+        size_mismatch = 0
+        errors = 0
+        dehydrated = 0
+        skipped_low_space = 0
+        reserve_bytes = int(max(0.0, args.min_free_gb) * (1024**3))
+
+        logger.info(
+            "Scanning %s pending/failed objects against %s (dehydrate=%s min_free=%.1fGB)",
+            len(rows),
+            yd,
+            dehydrate_after,
+            reserve_bytes / (1024**3),
+        )
+        logger.info("sync volume free=%.1f GB", free_bytes(yd) / (1024**3))
+
         for row in rows:
             src = _disk_local_path(yd, row["remote_path"])
             if src is None or not src.is_file():
