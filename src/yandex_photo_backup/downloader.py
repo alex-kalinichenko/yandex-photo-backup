@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 import zipfile
@@ -11,13 +12,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .adaptive import AdaptiveController
-from .client import AuthExpiredError, CaptchaRequiredError, RateLimitError, YandexPhotoClient
+from .client import (
+    AuthExpiredError,
+    CaptchaRequiredError,
+    RateLimitError,
+    YandexPhotoClient,
+)
 from .collect import extract_resources_from_response, parse_resource_item
 from .db import ManifestDB
 from .paths import ensure_under, sanitize_filename, year_month_subdir
 from .verify import md5_file, verify_local_file
 
 logger = logging.getLogger(__name__)
+
+# ORIGINAL CDN answers that usually mean this signed URL is unusable, while
+# the same object can still be fetched via mpfs/url or bulk-download-prepare.
+_HARD_CDN_HTTP = re.compile(r'(?:error:\s*|http\s+)(403|404|410|500)\b', re.IGNORECASE)
 
 _PREPARE_BLOCKED_UNTIL = 0.0
 _PREPARE_LOCK = threading.Lock()
@@ -41,6 +51,21 @@ def unique_target(path: Path) -> Path:
 def local_path_for(row, root: Path) -> Path:
     rel = year_month_subdir(row['year'], row['month']) / sanitize_filename(row['name'])
     return ensure_under(root, root / rel)
+
+
+def _original_cdn_needs_disk_fallback(errors: list[str]) -> bool:
+    """Return True when a failed ORIGINAL URL should be retried via Disk APIs.
+
+    Timeouts and HTTP 429 stay on the CDN path: prepare is rate-limited and
+    would stall photo workers. A dead signed URL (403/404/410/500 or an empty
+    body) is worth one Disk attempt.
+    """
+    text = ' '.join(errors).lower()
+    if '429' in text or 'rate limit' in text or 'circuit open' in text:
+        return False
+    if 'wrote 0 bytes' in text:
+        return True
+    return _HARD_CDN_HTTP.search(text) is not None
 
 
 def _normalize_remote_path(row) -> str:
@@ -71,7 +96,9 @@ def refresh_cluster_urls(
     )
     urls: dict[str, str] = {}
     updates: list[tuple] = []
-    for cid, item in extract_resources_from_response(data if isinstance(data, dict) else {}):
+    for cid, item in extract_resources_from_response(
+        data if isinstance(data, dict) else {}
+    ):
         parsed = parse_resource_item(item, cid)
         if not parsed or not parsed.get('original_url'):
             continue
@@ -90,6 +117,7 @@ def refresh_cluster_urls(
             )
         )
     if db is not None and updates:
+
         def _write() -> None:
             db.conn.executemany(
                 'UPDATE objects SET original_url=?, md5=COALESCE(?, md5), size=COALESCE(?, size), '
@@ -240,7 +268,9 @@ def download_one(
         )
         if ok:
             return True, f'already verified: {reason}', desired
-        logger.warning('Existing local file failed verification (%s); re-downloading', reason)
+        logger.warning(
+            'Existing local file failed verification (%s); re-downloading', reason
+        )
 
     final_path = desired if desired.exists() else unique_target(desired)
     digest = abs(hash(remote_id)) % 10_000_000
@@ -258,7 +288,11 @@ def download_one(
             pass
 
     # If a previous run left a complete .part, finalize without re-download.
-    if part_path.exists() and expected_size > 0 and part_path.stat().st_size == expected_size:
+    if (
+        part_path.exists()
+        and expected_size > 0
+        and part_path.stat().st_size == expected_size
+    ):
         ok, reason, actual_md5 = verify_local_file(
             part_path,
             expected_size=row['size'],
@@ -281,7 +315,9 @@ def download_one(
                 speed_limit = stall.speed_limit_bps
                 speed_time = stall.speed_time_s
             else:
-                read_timeout = min(6 * 3600, max(120, (size // 50_000) + 120 if size else 300))
+                read_timeout = min(
+                    6 * 3600, max(120, (size // 50_000) + 120 if size else 300)
+                )
                 speed_limit = 256
                 speed_time = 60
             written, content_type = client.download_bytes_stream(
@@ -305,11 +341,18 @@ def download_one(
                     errors.append('ORIGINAL wrote 0 bytes')
             except Exception as exc:
                 errors.append(f'ORIGINAL CDN: {exc}')
-            # Do not fall through to prepare after a failed ORIGINAL attempt:
-            # prepare is heavily rate-limited and would block photo workers.
 
-        # Videos / Disk paths usually have no Photoslice ORIGINAL — use prepare.
-        if not downloaded and not url:
+        # No Photoslice ORIGINAL, or the signed ORIGINAL URL is dead (500/404).
+        # Timeouts and 429 do not fall through: prepare is heavily rate-limited.
+        use_disk = not downloaded and (
+            not url or _original_cdn_needs_disk_fallback(errors)
+        )
+        if use_disk and url:
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if use_disk:
             direct = None
             try:
                 direct = client.get_file_url(remote_path)
@@ -365,7 +408,11 @@ def download_one(
 
         _safe_replace(part_path, final_path)
         success = True
-        label = f'verified md5={actual_md5}' if row['md5'] else f'verified size={expected_size}'
+        label = (
+            f'verified md5={actual_md5}'
+            if row['md5']
+            else f'verified size={expected_size}'
+        )
         return True, label, final_path
     except (AuthExpiredError, CaptchaRequiredError):
         raise
@@ -495,7 +542,9 @@ def download_pending(
             logger.info('OK %s — %s (%.1fs)', row['name'], message, duration)
             return True
         # Circuit / 429: keep as pending without permanent pressure from spam fails.
-        soft = 'circuit open' in message.lower() or 'prepare http 429' in message.lower()
+        soft = (
+            'circuit open' in message.lower() or 'prepare http 429' in message.lower()
+        )
         with db_lock:
             if soft:
                 # Do not consume attempt budget on API rate limits.
@@ -603,18 +652,24 @@ def download_pending(
                 verified_ids = {
                     r['remote_id']
                     for r in db.conn.execute(
-                        "SELECT remote_id FROM objects "
+                        'SELECT remote_id FROM objects '
                         "WHERE cluster_id=? AND verify_status='verified'",
                         (cluster_id,),
                     )
                 }
-            failed_ids = [row for row in cdn_rows if row['remote_id'] not in verified_ids]
+            failed_ids = [
+                row for row in cdn_rows if row['remote_id'] not in verified_ids
+            ]
             if failed_ids:
                 time.sleep(0.3)
                 try:
-                    urls2 = refresh_cluster_urls(client, db, cluster_id, db_lock=db_lock)
+                    urls2 = refresh_cluster_urls(
+                        client, db, cluster_id, db_lock=db_lock
+                    )
                 except Exception as exc:
-                    logger.warning('Cluster retry refresh failed %s: %s', cluster_id, exc)
+                    logger.warning(
+                        'Cluster retry refresh failed %s: %s', cluster_id, exc
+                    )
                     urls2 = {}
                 _run_batch(failed_ids, urls2)
 

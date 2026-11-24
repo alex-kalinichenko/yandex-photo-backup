@@ -39,19 +39,34 @@ def verify_local_file(
     *,
     expected_size: int | None,
     expected_md5: str | None,
+    compute_md5: bool | None = None,
 ) -> tuple[bool, str, str | None]:
-    """Return (ok, reason, actual_md5)."""
+    """Return (ok, reason, actual_md5).
+
+    MD5 is computed when ``expected_md5`` is set, or when ``compute_md5`` is True.
+    Pass ``compute_md5=False`` for a fast size+sniff check (e.g. post-recovery relink).
+    """
     if not path.exists():
         return False, 'missing file', None
     actual_size = path.stat().st_size
     if actual_size <= 0:
         return False, 'zero-byte file', None
-    if expected_size is not None and int(expected_size) > 0 and actual_size != int(expected_size):
+    if (
+        expected_size is not None
+        and int(expected_size) > 0
+        and actual_size != int(expected_size)
+    ):
         return False, f'size mismatch local={actual_size} remote={expected_size}', None
     if sniff_is_error_page(path):
         return False, 'content looks like error/HTML page', None
+    want_md5 = bool(expected_md5) if compute_md5 is None else compute_md5
+    if not want_md5:
+        return True, 'ok', None
     actual_md5 = md5_file(path)
-    if expected_md5:
-        if actual_md5.lower() != expected_md5.lower():
-            return False, f'md5 mismatch local={actual_md5} remote={expected_md5}', actual_md5
+    if expected_md5 and actual_md5.lower() != expected_md5.lower():
+        return (
+            False,
+            f'md5 mismatch local={actual_md5} remote={expected_md5}',
+            actual_md5,
+        )
     return True, 'ok', actual_md5
