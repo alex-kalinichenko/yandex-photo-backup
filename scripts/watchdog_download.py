@@ -24,10 +24,10 @@ def _resolve_data_root() -> Path:
         line = marker.read_text(encoding='utf-8').strip().splitlines()[0].strip()
         if line:
             return Path(line)
-    # Legacy Windows external disk used by this project
-    legacy = Path(r'D:\YandexPhoto')
-    if legacy.is_dir():
-        return legacy
+    # Legacy Windows external disks used by this project
+    for legacy in (Path(r'G:\YandexPhoto'), Path(r'D:\YandexPhoto')):
+        if legacy.is_dir():
+            return legacy
     return Path.home() / 'YandexPhoto'
 
 
@@ -59,7 +59,7 @@ def download_running() -> bool:
                 'powershell',
                 '-NoProfile',
                 '-Command',
-                "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                'Get-CimInstance Win32_Process -Filter "Name=\'python.exe\'" | '
                 "Where-Object { $_.CommandLine -match 'backup.py download' } | "
                 'Select-Object -ExpandProperty ProcessId',
             ],
