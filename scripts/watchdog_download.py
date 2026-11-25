@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -51,6 +52,45 @@ def _setup_logging() -> None:
     )
 
 
+def unpark_queue(data_root: Path) -> int:
+    """Put failed / failed_permanent rows back into pending when the queue is empty."""
+    db_path = data_root / 'yandex_photo_backup.sqlite'
+    if not db_path.exists():
+        return 0
+    db = sqlite3.connect(db_path, timeout=120)
+    row = db.execute(
+        """
+        SELECT
+          SUM(CASE WHEN download_status IN ('pending', 'failed') THEN 1 ELSE 0 END),
+          SUM(CASE WHEN verify_status != 'verified' THEN 1 ELSE 0 END)
+        FROM objects
+        """
+    ).fetchone()
+    pending = int(row[0] or 0)
+    unverified = int(row[1] or 0)
+    if pending > 0 or unverified == 0:
+        db.close()
+        return 0
+    now = time.time()
+    cur = db.execute(
+        """
+        UPDATE objects
+        SET download_status = 'pending',
+            verify_status = 'pending',
+            attempts = 0,
+            error = NULL,
+            updated_at = ?
+        WHERE verify_status != 'verified'
+        """,
+        (now,),
+    )
+    db.commit()
+    n = cur.rowcount
+    db.close()
+    logging.info('Unparked %s non-verified objects for another download pass', n)
+    return n
+
+
 def download_running() -> bool:
     """Return True if a backup.py download process is alive (Windows)."""
     try:
@@ -77,8 +117,10 @@ def start_download(extra_args: list[str]) -> subprocess.Popen:
     """Spawn download with unbuffered Python, appending to the adaptive log."""
     LOG.parent.mkdir(parents=True, exist_ok=True)
     log_f = LOG.open('a', encoding='utf-8')
-    env = dict(**{k: v for k, v in __import__('os').environ.items()})
+    env = dict(**{k: v for k, v in os.environ.items()})
     env['PYTHONUNBUFFERED'] = '1'
+    env.setdefault('YANDEX_PHOTO_MAX_ATTEMPTS', '0')
+    env.setdefault('YANDEX_PHOTO_ROOT', str(DATA_ROOT))
     cmd = [sys.executable, '-u', *extra_args]
     logging.info('Starting: %s', ' '.join(cmd))
     return subprocess.Popen(
@@ -113,6 +155,7 @@ def main() -> int:
                 logging.warning('Child exited code=%s', child.returncode)
                 child = None
             if not alive:
+                unpark_queue(DATA_ROOT)
                 logging.warning('Download not running — restarting')
                 child = start_download(dl_args)
                 time.sleep(15)

@@ -535,7 +535,7 @@ def download_pending(
     by_cluster: dict[str, list] = defaultdict(list)
     no_cluster: list = []
     for row in rows:
-        if int(row['attempts'] or 0) >= max_attempts:
+        if max_attempts > 0 and int(row['attempts'] or 0) >= max_attempts:
             db.mark_failed(row['remote_id'], 'max attempts exceeded', permanent=True)
             counters['failed'] += 1
             continue

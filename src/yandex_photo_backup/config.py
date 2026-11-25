@@ -46,7 +46,8 @@ class Config:
             cookies_path=cookies,
             tmp_dir=base / '_tmp',
             cluster_batch=int(os.environ.get('YANDEX_PHOTO_CLUSTER_BATCH', '8')),
-            max_attempts=int(os.environ.get('YANDEX_PHOTO_MAX_ATTEMPTS', '8')),
+            # 0 = never mark failed_permanent (retry until verified).
+            max_attempts=int(os.environ.get('YANDEX_PHOTO_MAX_ATTEMPTS', '0')),
         )
 
     def ensure_dirs(self) -> None:
