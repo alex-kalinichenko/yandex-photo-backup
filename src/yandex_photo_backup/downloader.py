@@ -65,6 +65,17 @@ def _original_cdn_needs_disk_fallback(errors: list[str]) -> bool:
         return False
     if 'wrote 0 bytes' in text:
         return True
+    if 'original verify:' in text:
+        return any(
+            marker in text
+            for marker in (
+                'zero-byte',
+                'html',
+                'mismatch',
+                'missing file',
+                'error page',
+            )
+        )
     return _HARD_CDN_HTTP.search(text) is not None
 
 
@@ -306,6 +317,14 @@ def download_one(
     try:
         errors: list[str] = []
         downloaded = False
+        verified_early = False
+        early_md5: str | None = None
+
+        if part_path.exists() and part_path.stat().st_size == 0:
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         def _try_cdn(cdn_url: str) -> bool:
             size = expected_size
@@ -336,11 +355,30 @@ def download_one(
 
         if url:
             try:
-                downloaded = _try_cdn(url)
-                if not downloaded:
+                if _try_cdn(url):
+                    ok_pre, reason_pre, md5_pre = verify_local_file(
+                        part_path,
+                        expected_size=row['size'],
+                        expected_md5=row['md5'],
+                    )
+                    if ok_pre:
+                        downloaded = True
+                        verified_early = True
+                        early_md5 = md5_pre
+                    else:
+                        errors.append(f'ORIGINAL verify: {reason_pre}')
+                        try:
+                            part_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                else:
                     errors.append('ORIGINAL wrote 0 bytes')
             except Exception as exc:
                 errors.append(f'ORIGINAL CDN: {exc}')
+                try:
+                    part_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         # No Photoslice ORIGINAL, or the signed ORIGINAL URL is dead (500/404).
         # Timeouts and 429 do not fall through: prepare is heavily rate-limited.
@@ -360,8 +398,23 @@ def download_one(
                 errors.append(f'mpfs/url: {exc}')
             if direct:
                 try:
-                    downloaded = _try_cdn(direct)
-                    if not downloaded:
+                    if _try_cdn(direct):
+                        ok_url, reason_url, md5_url = verify_local_file(
+                            part_path,
+                            expected_size=row['size'],
+                            expected_md5=row['md5'],
+                        )
+                        if ok_url:
+                            downloaded = True
+                            verified_early = True
+                            early_md5 = md5_url
+                        else:
+                            errors.append(f'mpfs/url verify: {reason_url}')
+                            try:
+                                part_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    else:
                         errors.append('mpfs/url wrote 0 bytes')
                 except Exception as exc:
                     errors.append(f'mpfs/url CDN: {exc}')
@@ -377,7 +430,19 @@ def download_one(
                         expected_size=expected_size,
                         controller=controller,
                     )
-                    downloaded = True
+                    ok_prep, reason_prep, _ = verify_local_file(
+                        part_path,
+                        expected_size=row['size'],
+                        expected_md5=row['md5'],
+                    )
+                    if ok_prep:
+                        downloaded = True
+                    else:
+                        errors.append(f'prepare verify: {reason_prep}')
+                        try:
+                            part_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 except RateLimitError as exc:
                     errors.append(str(exc))
                 except Exception as exc:
@@ -385,11 +450,14 @@ def download_one(
 
         if not downloaded:
             raise RuntimeError('; '.join(errors) or 'no download method succeeded')
-        ok, reason, actual_md5 = verify_local_file(
-            part_path,
-            expected_size=row['size'],
-            expected_md5=row['md5'],
-        )
+        if verified_early:
+            ok, reason, actual_md5 = True, 'ok', early_md5
+        else:
+            ok, reason, actual_md5 = verify_local_file(
+                part_path,
+                expected_size=row['size'],
+                expected_md5=row['md5'],
+            )
         if not ok:
             # Corrupt / HTML error page: drop part so the next attempt starts clean.
             # Size mismatch on a still-growing resume is kept only if below expected.

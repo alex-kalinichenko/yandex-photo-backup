@@ -60,8 +60,10 @@ def download_running() -> bool:
                 '-NoProfile',
                 '-Command',
                 'Get-CimInstance Win32_Process -Filter "Name=\'python.exe\'" | '
-                "Where-Object { $_.CommandLine -match 'backup.py download' } | "
-                'Select-Object -ExpandProperty ProcessId',
+                "Where-Object { "
+                "$_.CommandLine -match 'backup\\.py\\s+download' "
+                "-and $_.CommandLine -notmatch 'watchdog_download' "
+                '} | Select-Object -ExpandProperty ProcessId',
             ],
             text=True,
             timeout=60,

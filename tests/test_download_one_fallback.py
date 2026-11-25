@@ -110,11 +110,42 @@ def test_http_500_falls_through_to_prepare(
     assert final.read_bytes() == b'jpeg'
 
 
+class _ClientEmptyOriginal(_Client):
+    def download_bytes_stream(
+        self, url: str, dest: Path, **_kwargs: object
+    ) -> tuple[int, str]:
+        self.seen.append(url)
+        if url == 'https://cdn/original':
+            dest.write_bytes(b'')
+            return 1, 'image/jpeg'
+        payload = b'jpeg'
+        dest.write_bytes(payload)
+        return len(payload), 'image/jpeg'
+
+
+def test_empty_original_body_uses_disk_url(tmp_path: Path) -> None:
+    client = _ClientEmptyOriginal(
+        fail_with='unused',
+        direct='https://cdn/direct',
+    )
+    ok, _message, final = download_one(
+        client,  # type: ignore[arg-type]
+        _row(),
+        files_root=tmp_path / 'files',
+        tmp_root=tmp_path / 'tmp',
+        url='https://cdn/original',
+    )
+    assert ok
+    assert final is not None
+    assert client.file_url_calls == 1
+
+
 @pytest.mark.parametrize(
     ('errors', 'expected'),
     [
         (['ORIGINAL CDN: error: 404'], True),
         (['ORIGINAL wrote 0 bytes'], True),
+        (['ORIGINAL verify: zero-byte file'], True),
         (['ORIGINAL CDN: curl failed (28): timeout'], False),
         (['prepare HTTP 429'], False),
     ],
