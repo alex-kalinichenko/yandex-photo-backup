@@ -15,6 +15,23 @@ sys.path.insert(0, str(ROOT / 'src'))
 
 from yandex_photo_backup.config import Config  # noqa: E402
 from yandex_photo_backup.downloader import local_path_for  # noqa: E402
+from yandex_photo_backup.verify import verify_local_file  # noqa: E402
+
+
+def _local_hint(row: sqlite3.Row, files_dir: Path) -> str:
+    """Describe whether the expected local file exists and passes verification."""
+    path = local_path_for(row, files_dir)
+    if not path.is_file():
+        return 'missing on disk'
+    try:
+        ok, reason, _ = verify_local_file(
+            path,
+            expected_size=row['size'],
+            expected_md5=row['md5'],
+        )
+    except OSError:
+        return 'unreadable (cloud placeholder?)'
+    return 'verified OK — run adopt_local_files.py' if ok else reason
 
 
 def _disk_client_url(remote_path: str | None) -> str:
@@ -89,13 +106,15 @@ def main() -> int:
                     'disk_web_url',
                     'original_url',
                     'md5',
-                    'download_status',
-                    'error',
-                    'remote_id',
+                'download_status',
+                'local_file_status',
+                'error',
+                'remote_id',
                 ]
             )
             for row in rows:
                 local = local_path_for(row, cfg.files_dir)
+                hint = _local_hint(row, cfg.files_dir)
                 writer.writerow(
                     [
                         row['name'],
@@ -109,6 +128,7 @@ def main() -> int:
                         row['original_url'] or '',
                         row['md5'] or '',
                         row['download_status'],
+                        hint,
                         (row['error'] or '').replace('\t', ' ').replace('\n', ' '),
                         row['remote_id'],
                     ]
@@ -137,6 +157,7 @@ def main() -> int:
                 if row['taken_at']:
                     fh.write(f'- **Taken:** {row["taken_at"]}\n')
                 fh.write(f'- **Save as (local backup):** `{local}`\n')
+                fh.write(f'- **On disk now:** {_local_hint(row, cfg.files_dir)}\n')
                 if row['remote_path']:
                     fh.write(f'- **Remote path:** `{row["remote_path"]}`\n')
                 disk_url = _disk_client_url(row['remote_path'])

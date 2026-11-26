@@ -21,7 +21,7 @@ from yandex_photo_backup.config import Config  # noqa: E402
 from yandex_photo_backup.db import ManifestDB  # noqa: E402
 from yandex_photo_backup.downloader import local_path_for  # noqa: E402
 from yandex_photo_backup.paths import year_month_subdir  # noqa: E402
-from yandex_photo_backup.verify import sniff_is_error_page  # noqa: E402
+from yandex_photo_backup.verify import sniff_is_error_page, verify_local_file  # noqa: E402
 
 logger = logging.getLogger('relink_local_files')
 
@@ -142,16 +142,50 @@ def main() -> int:
 
             if found is None:
                 expected = local_path_for(row, cfg.files_dir)
-                rel = expected.relative_to(cfg.files_dir).as_posix().lower()
-                cand = by_rel.get(rel)
-                if cand is not None and (size <= 0 or cand.stat().st_size == size):
-                    found = cand
+                if expected.is_file():
+                    ok, _reason, _ = verify_local_file(
+                        expected,
+                        expected_size=row['size'],
+                        expected_md5=row['md5'],
+                    )
+                    if ok:
+                        found = expected
+                if found is None:
+                    rel = expected.relative_to(cfg.files_dir).as_posix().lower()
+                    cand = by_rel.get(rel)
+                    if cand is not None:
+                        ok, _reason, _ = verify_local_file(
+                            cand,
+                            expected_size=row['size'],
+                            expected_md5=row['md5'],
+                        )
+                        if ok:
+                            found = cand
 
             if found is None and size > 0:
                 matches = by_name_size.get((str(row['name']).lower(), size), [])
-                if len(matches) == 1:
-                    found = matches[0]
-                elif len(matches) > 1:
+                valid_matches: list[Path] = []
+                for cand in matches:
+                    ok, _reason, _ = verify_local_file(
+                        cand,
+                        expected_size=row['size'],
+                        expected_md5=row['md5'],
+                    )
+                    if ok:
+                        valid_matches.append(cand)
+                if len(valid_matches) == 1:
+                    found = valid_matches[0]
+                elif len(valid_matches) > 1:
+                    matches = valid_matches
+                elif len(matches) == 1:
+                    ok, _reason, _ = verify_local_file(
+                        matches[0],
+                        expected_size=row['size'],
+                        expected_md5=row['md5'],
+                    )
+                    if ok:
+                        found = matches[0]
+                if found is None and len(matches) > 1:
                     # Prefer year/month subdir match when available.
                     prefer = (
                         year_month_subdir(row['year'], row['month']).as_posix().lower()
